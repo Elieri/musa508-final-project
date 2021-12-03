@@ -1,2 +1,2 @@
-# musa508-final-project
-MUSA 508 Final Project: Forecasting Train Delays
+# MUSA 508 Final Project: Forecasting Train Delays
+E. Ericson & A. León
