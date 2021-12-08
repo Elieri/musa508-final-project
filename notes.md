@@ -6,7 +6,8 @@
 
 **data issues**
 
-- at first glace, amtrak trains in at least sep 2019 have no scheduled time and NA values for `delay_minutes` and `stop_sequence`. look for more info in documentation? we could omit all amtrak trains and just look at nj transit, but what if amtrak train timing affects nj transit on-time performance? need to look into this more
+- amtrak trains have no `scheduled_time` data, and therefore also no `delay_minutes`. (they also don't have `stop_sequence` data, but that probably doesn't matter if we don't have delays.) this may mean we have to limit our predictions to nj transit trains, but maybe we could incorporate amtrak traffic as a feature somehow? not sure how to do this technically, though, or what exactly the amtrak data will allow.
+- some nj transit trains may also have missing values
 
 **time**
 
