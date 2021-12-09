@@ -1,0 +1,11 @@
+ggplot charts
+
+- worst delays by train line - bar chart
+- network map with delays by stop (graduated symbol)
+- line - x axis is stops, y axis is delay - cumulative delay from start to end of line
+	- check out geom_step for this
+	- highlight 'worst offenders' (top 3?) - different color circle/line?
+	- two versions: show actual 'bad delays' then transition/contrast with 
+- chart for a given stop - bar chart?
+
+- use hex codes to match app color scheme
