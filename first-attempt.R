@@ -35,6 +35,27 @@ plotTheme <- function() {
 
 # --- DATA WRANGLING
 
-# read in data
-data_2019_09 <- read.csv("data/2019_09.csv")
-data_2019_10 <- read.csv("data/2019_09.csv")
+# read in data for training period
+data_2019_09 <- read.csv("data/2019_09.csv") %>%
+  mutate(set = "training")
+
+# read in data for test period
+data_2019_10 <- read.csv("data/2019_10.csv") %>%
+  filter(as.Date(date) <= as.Date("2019-10-14")) %>%
+  mutate(set = "test")
+
+# merge data for further wrangling
+data <- rbind(data_2019_09, data_2019_10) %>%
+  # exclude Amtrak trains, which have no delay data
+  filter(type == "NJ Transit") %>%
+  mutate(
+    # standardize datetime columns
+    scheduled_time = ymd_hms(scheduled_time),
+    actual_time = ymd_hms(actual_time)
+  ) %>%
+  # drop trains with missing values
+  drop_na()
+
+# --- temporal data wrangling with lubridate ---
+
+
