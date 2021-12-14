@@ -5,7 +5,6 @@ library(tidyverse)
 library(lubridate)
 library(sf)
 library(ggmap)
-library(basemaps)
 library(riem) # TODO: delete if not using
 
 # prevent scientific notation
@@ -107,11 +106,8 @@ delays_by_station  <- data %>%
             mean_delay_minutes = mean(delay_minutes),
             median_delay_minutes = median(delay_minutes),
             max_delay_minutes = max(delay_minutes)) %>%
-  arrange(desc(total_delay_minutes)) %>%
-  left_join(dplyr::select(stations, stop_id, geometry), 
-            by = c("to_id" = "stop_id")) %>%
-  arrange(desc(total_delay_minutes)) %>%
-  st_sf()
+  arrange(desc(total_delay_minutes))
+  
 
 # --- map delays by station ---
 
@@ -130,21 +126,9 @@ g + geom_sf(data = rail_lines, inherit.aes = FALSE)
 
 test <- stations
 
-%>% st_transform(3857)
 
 
-nj_bb <- c(
-  left = -75.2,
-  bottom = 39.4,
-  right = -74,
-  top = 41.5
-)
 
-test <- get_map(location = nj_bb, source = "stamen", maptype = "toner-lite", zoom = 10)
-
-test <- get_stamenmap(bbox = nj_bb, maptype = "toner-lite", zoom = 10)
-
-m <- ggmap(test)
 
 m +
   geom_sf(data = rail_lines, inherit.aes = FALSE)
@@ -180,7 +164,7 @@ g +
   geom_sf(data = filter(data, train_id %in% c("3722", "7224")) %>% arrange(delay_minutes),
           aes(size = delay_minutes,
               color = delay_minutes),
-          inherit.aes = FALSE, show.legend = TRUE) +
+          inherit.aes = FALSE, show.legend = FALSE) +
   scale_color_stepsn(n.breaks = 5, colors = theme_scale) +
   scale_size_continuous(range = c(1, 10)) +
   labs(x = "", y = "") +
@@ -203,8 +187,6 @@ system_bbox <- st_as_sfc(st_bbox(st_union(rail_lines))) %>% st_sf() %>% st_trans
 system_centroid <- st_coordinates(st_centroid(system_bbox))
 
 
-basemap <- get_map(location = map_centroid, source = "stamen", maptype = "toner")
-
 
 
 ggplot() +
@@ -214,3 +196,15 @@ ggplot() +
   geom_sf(data = st_centroid(st_union(rail_lines)), color = "red") +
   geom_sf(data = st_centroid(st_convex_hull(st_union(rail_lines))), color = "blue") +
   geom_sf(data = st_centroid(map_bbox), color = "green")
+
+
+
+
+
+data %>%
+  ggplot(aes(scheduled_hour, delay_minutes, colour = line)) + geom_line() +
+  # geom_vline(data = mondays, aes(xintercept = monday)) +
+  labs(title="Rideshare trips by week: November-December",
+       subtitle="Dotted lines for Thanksgiving & Christmas", 
+       x="Day", y="Trip Count") +
+  plotTheme() + theme(panel.grid.major = element_blank()) 
