@@ -5,7 +5,7 @@ library(tidyverse)
 library(lubridate)
 library(sf)
 library(ggmap)
-library(riem) # TODO: delete if not using
+library(riem)
 
 # prevent scientific notation
 options(scipen = 999)
@@ -44,7 +44,8 @@ plotTheme <-
     panel.grid.minor = element_line(color = "gray75", size = 0.1),
     plot.title = element_text(face = "bold"),
     plot.subtitle = element_text(face = "italic"),
-    plot.caption = element_text(hjust = 0))
+    plot.caption = element_text(hjust = 0)
+  )
 
 # set basemap options
 # set_defaults(map_service = "carto", map_type = "dark_no_labels")

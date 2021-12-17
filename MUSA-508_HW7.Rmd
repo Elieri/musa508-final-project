@@ -13,7 +13,6 @@ output:
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = T, warning = F, error = F, message = F, results = F, cache=T)
 
-
 # load libraries
 library(sf)
 library(riem)
@@ -25,7 +24,7 @@ library(gifski)
 library(tigris)
 library(stringr)
 library(mapview)
-library(geojsonR)
+# library(geojsonR)
 library(tidyverse)
 library(lubridate)
 library(gganimate)
@@ -177,7 +176,7 @@ njData <- data %>%
                 -type,
                 -time,
                 -stop_name) %>%
-  filter(week %in% c(39:43)) %>%                                          # select 5 week period
+  filter(week %in% c(38:43)) %>%                                          # select 5 week period
   na.omit(delay)                                                          # drop trains with missing values
 
 
@@ -254,7 +253,7 @@ grid.arrange(top = "Weather Data: New Jersey, September & October 2019",
 
 
 
-```{r }
+```{r presentation maps, eval = F}
 
 
 # --- map delays by station ---
@@ -262,7 +261,7 @@ grid.arrange(top = "Weather Data: New Jersey, September & October 2019",
 ggmap_center <- c(lon = -74.4, lat = 40.4)
 g <- ggmap(get_googlemap(center = ggmap_center, maptype = "terrain", color = "bw", zoom = 9, scale = 4))
 
-g2 <- ggmap(get_googlemap(center = system_centroid, maptype = "terrain", color = "bw", zoom = 9, scale = 4))
+# g2 <- ggmap(get_googlemap(center = system_centroid, maptype = "terrain", color = "bw", zoom = 9, scale = 4))
 
 g + geom_sf(data = rail_lines, inherit.aes = FALSE)
 
@@ -766,6 +765,37 @@ weekPredictions %>%
 ```
 
 
+```{r validation: plot predicted and observed by hour}
+
+pred_time_plot_data <- 
+  weekPredictions %>%
+  mutate(
+    interval60 = map(data, pull, interval60),
+    station = map(data, pull, station),
+  ) %>%
+  dplyr::select(interval60, station, Observed, Prediction, Regression) %>%
+  unnest() %>%
+  rename(Predicted = Prediction) %>%
+  gather(variable, value, -Regression, -interval60, -station) %>%
+  group_by(Regression, variable, interval60) %>%
+  summarize(value = mean(value))
+
+filter(pred_time_plot_data) %>%
+  ggplot(aes(interval60, value, color = variable)) +
+  geom_line() +
+  # geom_vline(xintercept = halloween, linetype = "dotted") +
+  # geom_vline(data = mondays, aes(xintercept = hour), size = 0.25) +
+  facet_wrap(~Regression, ncol = 1) +
+  # scale_color_manual(values = palette2) +
+  labs(title = "Predicted and observed trips by hour",
+       subtitle = "Solid lines for Mondays; dotted line for Halloween",
+       x = "Trips",
+       y = "Date") +
+  plotTheme +
+  theme(legend.position = "bottom")
+
+```
+
 
 ```{r errorMaps, fig.height=12, fig.width=12}
 
@@ -845,10 +875,9 @@ errorWeek %>%
 ```
 
 
-
 ```{r error map day, fig.height=18, fig.width=12}
 
-# make a map of MAES by hour of day
+# make a map of MAES by hour of day6
 errorDay %>%
   ggplot() +
   geom_sf(data=njCounties, colour = "#222222", fill = "#3a3a3a") +
@@ -882,7 +911,15 @@ errorDay %>%
 
 
 
-```{r LOGO CV}
+```{r LOGO CV, eval=F}
+
+# TODO: fix cv errors, incl this one:
+# Quitting from lines 885-989 (MUSA-508_HW7.Rmd) 
+# Error: Problem with `filter()` input `..1`.
+# ℹ Input `..1` is `dataset[[id]] != thisFold`.
+# x Must extract column with a single valid subscript.
+# x Subscript `id` has size 186480 but must be size 1.
+
 
 # CrossValidations: by neighborhood or census tract.
 # define cross validation formula
@@ -930,6 +967,8 @@ regVarsRand <-  c('GEOID',
 
 
 # spatial (counties) LOGO CV          ## ERROR: "no simple features column present", might need to join back the station points???
+
+
 regCVrandom <- crossValidate(
   dataset = z,
   id = "cvID",
@@ -959,7 +998,8 @@ regCVcounties <- crossValidate(
   indVariables = regVars) %>%
     dplyr::select(cvID = GEOID, delayAggr, Prediction, geometry)
 
-
+# TODO: 
+# "Line 885: 
 
 # compute errors and MAE by station/hour
 regCV1 <- regCVrandom %>%
