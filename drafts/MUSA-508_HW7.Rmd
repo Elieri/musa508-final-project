@@ -1,0 +1,1041 @@
+---
+title: "HEADWAY - a tool for predicting train delays"
+author: "Elisabeth Ericson & Adrián León"
+date: "11/30/2021"
+output: 
+  html_document: 
+    toc: true
+    toc_float: true
+    code_folding: hide
+    
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = T, warning = F, error = F, message = F, results = F, cache=T)
+
+# load libraries
+library(sf)
+library(riem)
+library(caret)
+library(spdep)
+library(knitr)
+library(ggmap)
+library(gifski)
+library(tigris)
+library(stringr)
+library(mapview)
+# library(geojsonR)
+library(tidyverse)
+library(lubridate)
+library(gganimate)
+library(gridExtra)
+library(kableExtra)
+
+
+# Set options
+options(scipen = 999)
+options(tigris_class = "sf")
+source("https://raw.githubusercontent.com/urbanSpatial/Public-Policy-Analytics-Landing/master/functions.r")
+set.seed(512)
+
+# set coordinate reference system: 
+# nj_crs = "EPSG:3424" # NAD83/New Jersey
+nj_crs = "EPSG:4326"
+
+
+# define theme colors
+theme_orange <- "#f15a24"
+theme_red <- "#d4145a"
+theme_blue <- "#29abe2"
+theme_green <- "#22b573"
+theme_scale <- c("#22b573", "#29abe2", "#d4145a", "#f15a24")
+
+palette2 <- c("#6baed6","#08519c")
+palette5 <- c("#eff3ff","#bdd7e7","#6baed6","#3182bd","#08519c")
+
+
+# set map styling options
+# mapTheme <-
+#   theme(
+#     axis.text = element_blank(),
+#     axis.ticks = element_blank(),
+#     panel.background = element_blank(),
+#     plot.title = element_text(face = "bold"),
+#     plot.subtitle = element_text(face = "italic"),
+#     plot.caption = element_text(hjust = 0)
+#   )
+
+
+# set plot styling options
+# plotTheme <-
+#   theme(
+#     axis.ticks = element_blank(),
+#     legend.title = element_blank(),
+#     panel.background = element_blank(),
+#     panel.grid.major = element_line(color = "gray75", size = 0.1),
+#     panel.grid.minor = element_line(color = "gray75", size = 0.1),
+#     plot.title = element_text(face = "bold"),
+#     plot.subtitle = element_text(face = "italic"),
+#     plot.caption = element_text(hjust = 0))
+
+# function shorcuts
+g <- glimpse
+m <- mapview
+len <- length
+st_c <- st_coordinates
+
+
+
+```
+
+
+
+
+
+### Data Exploration
+
+```{r load train data}
+
+# load data
+data <- rbind(read.csv("data/2019_09.csv"),
+              read.csv("data/2019_10.csv"))
+
+# load station data
+stations <- read.csv("data/stops.csv") %>%
+  filter(stop_id %in% unique(data$to_id)) %>%
+  st_as_sf(coords = c("stop_lon", "stop_lat")) %>%
+  st_set_crs("EPSG:4326") %>%
+  st_transform(nj_crs) %>%
+  dplyr::select(-stop_code, -stop_desc, -zone_id) %>%
+  mutate(cvID = sample(round(nrow(.) / 1.15),               # random CV ID (out of 100)
+                       size=nrow(.), replace = TRUE))
+
+# get counties geometry of states where NJ rail operates
+stateCounties <- rbind(tigris::counties(state = 34),
+                  tigris::counties(state = 36),
+                  tigris::counties(state = 42)
+                  ) %>%
+  dplyr::select(GEOID, NAME, geometry) %>%
+  st_transform(st_crs(nj_crs))
+
+# spatial join GEOIDs of counties to stations in them
+railCounties <- stations %>%
+  st_join(stateCounties)%>%
+  dplyr::select(-stop_name, -NAME, -cvID)
+
+# get geometry back for those counties
+counties <- railCounties %>%
+  distinct(GEOID) %>%
+  left_join(stateCounties) %>%
+  st_sf()
+
+
+# read in rail line map
+njLines <- st_read("https://opendata.arcgis.com/datasets/e6701817be974795aecc7f7a8cc42f79_0.geojson") %>%
+  st_transform(nj_crs)
+
+
+# data wrangling
+
+# process trains data
+vars <- c("date",           # take out
+          "train_id",       # KEEP to infer direction
+          "stop_sequence",  # take out (deficient/uneven data upon inspection)
+          "from",           # redundant with from_id, take out
+          "from_id",        # KEEP
+          "to",             # redundant with to_id, take out
+          "to_id",          # KEEP
+          "scheduled_time", # take out after using
+          "actual_time",    # take out after using
+          "delay_minutes",  # DEPENDENT VARIABLE <- convert
+          "status",         # Get rid of cancelled trains
+          "line",           # KEEP
+          "type")           # take out
+
+
+njData <- data %>%  
+  filter(type == "NJ Transit") %>%                                        # exclude Amtrak trains
+  filter(status != 'cancelled') %>%                                       # exclude cancelled trains 
+  mutate(time = ymd_hms(scheduled_time),                                  # get time units from scheduled_time
+         week = week(time),
+         dotw = wday(time, label = T),
+         interval60 = floor_date(time, unit='hour'),
+         interval30 = floor_date(time, unit='30 mins'),
+         interval15 = floor_date(time, unit='15 mins')) %>% 
+  rename('delay' = delay_minutes) %>%
+  left_join(stations, by=c('to_id'='stop_id')) %>%                        # join station data
+  mutate(station = paste(to_id, line, sep="_")) %>%                       # create line-station combinations 
+  left_join(st_drop_geometry(railCounties), by=c('to_id'='stop_id')) %>%  # join counties (for LOGO-CV 1)
+  dplyr::select(-train_id,
+                -date,                                                    # take out unused variables
+                -stop_sequence,
+                -from,
+                -to,
+                -scheduled_time,
+                -actual_time,
+                -type,
+                -time,
+                -stop_name) %>%
+  filter(week %in% c(38:43)) %>%                                          # select 5 week period
+  na.omit(delay)                                                          # drop trains with missing values
+
+
+# set lines to analyze
+lines <- c("Northeast Corrdr",
+           "Atl. City Line",
+           "Princeton Shuttle",
+           "No Jersey Coast",
+           "Morristown Line",
+           "Pascack Valley",
+           "Raritan Valley",
+           "Main Line",
+           "Montclair-Boonton",
+           "Bergen Co. Line ",
+           "Gladstone Branch",
+           "Meadowlands Rail")
+
+  
+```
+
+
+
+
+
+
+
+
+```{r weather data, fig.height=8, fig.width=12}
+
+# get weather data
+weatherData <- 
+  riem_measures(station = "EWR", date_start = "2019-09-24", date_end = "2019-10-29")
+
+# convert into panel
+weatherPanel <-  
+  weatherData %>%
+  mutate_if(is.character, list(~replace(as.character(.), is.na(.), "0"))) %>%  # convert string NAs to NAs and then to 0s
+  replace(is.na(.), 0) %>%                                                     # convert NAs to 0s
+  mutate(interval60 = ymd_h(substr(valid, 1, 13))) %>%                         # round to hour intervals
+  mutate(interval30 = interval60) %>%                                          # assume no changes withing half hours
+  mutate(week = week(interval60),                                              # get week
+         dotw = wday(interval60, label=TRUE)) %>%                              # get day of the week
+  group_by(interval60) %>%                                                     # group by hour 
+  summarize(Temperature = max(tmpf),                                           # summarize temperature, precipitation and windspeed
+            Precipitation = sum(p01i),
+            WindSpeed = max(sknt)) %>%
+  mutate(Temperature = ifelse(Temperature == 0, 42, Temperature))
+
+
+# create charts by weather indicator
+grid.arrange(top = "Weather Data: New Jersey, September & October 2019",
+  ggplot(weatherPanel, aes(interval60, Precipitation)) +
+    geom_line() +
+    labs(title="Precipitation", x="Hour", y="Precipitation") +
+    plotTheme() +
+    theme(panel.border = element_blank(),
+        panel.background = element_rect(fill = "#eeeeee")),
+  ggplot(weatherPanel, aes(interval60, WindSpeed)) +
+    geom_line() + 
+    labs(title="Wind Speed", x="Hour", y="Wind Speed") +
+    plotTheme() +
+    theme(panel.border = element_blank(),
+        panel.background = element_rect(fill = "#eeeeee")),
+  ggplot(weatherPanel, aes(interval60, Temperature)) +
+    geom_line() + 
+    labs(title="Temperature", x="Hour", y="Temperature (ºF)") +
+    plotTheme() +
+    theme(panel.border = element_blank(),
+          panel.background = element_rect(fill = "#eeeeee")))
+
+
+```
+
+
+
+
+```{r presentation maps, eval = F}
+
+
+# --- map delays by station ---
+
+ggmap_center <- c(lon = -74.4, lat = 40.4)
+g <- ggmap(get_googlemap(center = ggmap_center, maptype = "terrain", color = "bw", zoom = 9, scale = 4))
+
+# g2 <- ggmap(get_googlemap(center = system_centroid, maptype = "terrain", color = "bw", zoom = 9, scale = 4))
+
+g + geom_sf(data = rail_lines, inherit.aes = FALSE)
+
+test <- stations
+
+
+
+
+
+m +
+  geom_sf(data = rail_lines, inherit.aes = FALSE)
+
+# 
+g +
+  #geom_sf(data = rail_lines, inherit.aes = FALSE, color = "gray10") +
+  geom_sf(data = filter(rail_lines, LINE_CODE == "NC"),
+          color = theme_red, size = 2, inherit.aes = FALSE) +
+  geom_sf(data = filter(rail_lines, LINE_CODE == "NE"),
+          color = theme_orange, size = 2, inherit.aes = FALSE) +
+  labs(x = "", y = "") +
+  mapTheme
+  
+
+g +
+  geom_sf(data = filter(rail_lines, LINE_CODE %in% c("NC", "NE")),
+          color = "gray40", size = 1, inherit.aes = FALSE, show.legend = FALSE) +
+  geom_sf(data = delays_by_station,
+          aes(size = mean_delay_minutes,
+              color = mean_delay_minutes),
+          inherit.aes = FALSE, show.legend = FALSE) +
+  scale_color_stepsn(n.breaks = 4, colors = theme_scale) +
+  scale_size_continuous(range = c(0.5, 8)) +
+  labs(x = "", y = "") +
+  mapTheme
+
+
+
+g +
+  geom_sf(data = filter(rail_lines, LINE_CODE %in% c("NC", "NE")),
+          color = "gray40", size = 1, inherit.aes = FALSE, show.legend = FALSE) +
+  geom_sf(data = filter(data, train_id %in% c("3722", "7224")) %>% arrange(delay_minutes),
+          aes(size = delay_minutes,
+              color = delay_minutes),
+          inherit.aes = FALSE, show.legend = FALSE) +
+  scale_color_stepsn(n.breaks = 5, colors = theme_scale) +
+  scale_size_continuous(range = c(1, 10)) +
+  labs(x = "", y = "") +
+  mapTheme
+
+
++
+  scale_size_continuous() +
+  scale_color_stepsn(n.breaks = 3, colors = c("green", "orange", "red")) +
+  mapTheme
+  
+
+
+
+
+map_bbox <- st_as_sfc(st_bbox(st_union(rail_lines))) %>% st_sf() %>% st_transform("EPSG:4326")
+map_centroid <- st_coordinates(st_centroid(map_bbox))
+
+system_bbox <- st_as_sfc(st_bbox(st_union(rail_lines))) %>% st_sf() %>% st_transform("EPSG:4326")
+system_centroid <- st_coordinates(st_centroid(system_bbox))
+
+
+
+
+ggplot() +
+  geom_sf(data = map_bbox) +
+  geom_sf(data = rail_lines) +
+  #geom_sf(data = stations) +
+  geom_sf(data = st_centroid(st_union(rail_lines)), color = "red") +
+  geom_sf(data = st_centroid(st_convex_hull(st_union(rail_lines))), color = "blue") +
+  geom_sf(data = st_centroid(map_bbox), color = "green")
+
+
+
+
+
+data %>%
+  ggplot(aes(scheduled_hour, delay_minutes, colour = line)) + geom_line() +
+  # geom_vline(data = mondays, aes(xintercept = monday)) +
+  labs(title="Rideshare trips by week: November-December",
+       subtitle="Dotted lines for Thanksgiving & Christmas", 
+       x="Day", y="Trip Count") +
+  plotTheme() + theme(panel.grid.major = element_blank()) 
+
+
+```
+
+
+
+```{r create panels}
+
+
+# sum delays per station per line per hour (don't have good info to assume direction)
+d_station <- njData %>%
+  group_by(station, interval60) %>%              # INCREMENT to half hours?
+  summarize(delayAggr = sum(delay))
+
+# create empty panel with all possible time/space combinations
+# 222 line-station combinations by 840 time intervals = 186480
+
+basePanel <- 
+  expand.grid(interval60 = unique(njData$interval60),   # INCREMENT to half hours?
+              station = unique(njData$station))
+
+# join trips information into panel by hour
+tripsPanel <- 
+  d_station %>%
+  right_join(basePanel) %>%
+  left_join(weatherPanel, by = "interval60") %>%        # INCREMENT to half hours?
+  mutate(week = week(interval60),
+         dotw = wday(interval60, label = TRUE))
+
+# create lag variables
+delaysPanel <- 
+  tripsPanel %>% 
+  arrange(station, interval60) %>% 
+  replace(is.na(.), 0) %>%
+  group_by(station) %>% 
+  mutate(lagHour =    dplyr::lag(delayAggr, 1),
+         lag2Hours =  dplyr::lag(delayAggr, 2),
+         lag3Hours =  dplyr::lag(delayAggr, 3),
+         lag4Hours =  dplyr::lag(delayAggr, 4),
+         lag12Hours = dplyr::lag(delayAggr, 12),
+         lag1day =    dplyr::lag(delayAggr, 24)) %>%
+  ungroup()
+
+
+# version of delaysPanel with counties and point geometry for stations
+delaysPanelSpatial <- delaysPanel %>%
+  mutate(id = as.integer(str_extract(station, '[0-9]*'))) %>%
+  left_join(railCounties, by=c("id"="stop_id")) %>%
+  st_sf()
+
+
+# Partition the resulting data in two sets, training on 3 weeks and testing on the following 2
+delaysTrain <- filter(delaysPanelSpatial, week <= 41)
+delaysTest <- filter(delaysPanelSpatial, week > 41)
+
+
+```
+
+
+### Exploratory Analysis
+
+```{r }
+
+# TO PRODUCE CHARTS:
+
+# just a table for the network delays
+# a bar chart for lines
+# a map and bar chart for stations (overall).
+
+# Delays by Network, Lines and Station aggregates
+
+selLines <- lines #c("No Jersey Coast", "Northeast Corrdr")
+
+# the entire network
+delaysNetwork <- njData %>%
+  summarize(totalDelay = sum(delay),
+            meanDelay = mean(delay))
+
+# by Line  
+delaysLine <- njData %>%
+  group_by(line) %>%
+  summarize(totalDelay = sum(delay),
+            meanDelay = mean(delay)) %>%
+  arrange(desc(meanDelay)) 
+
+# by Station
+delaysStation <- njData %>%
+  filter(line %in% selLines) %>%
+  group_by(to_id) %>%
+  summarize(totalDelay = sum(delay),
+            meanDelay = mean(delay)) %>%
+  arrange(desc(meanDelay)) %>%
+  left_join(stations, by=c('to_id'='stop_id'))  # add name and geometry to plot
+
+
+```
+
+
+
+```{r fig.height=3.5, fig.width=12}
+
+
+# set beginning of 'week' according to january 1st
+tuesdays <- 
+  mutate(delaysPanel,
+         day = ifelse(dotw == "Tue" & hour(interval60) == 1,
+                         interval60, 0)) %>%
+  filter(day != 0) 
+
+
+rbind(
+  mutate(delaysTrain, legend = "Training"), 
+  mutate(delaysTest, legend = "Testing")) %>%
+  group_by(legend, interval60) %>% 
+  summarize(delays = sum(delayAggr)) %>%
+  ungroup() %>% 
+  ggplot(aes(interval60, delays, colour = legend)) +
+  geom_line() +
+  scale_colour_manual(values = palette2) +
+  geom_vline(data = tuesdays, aes(xintercept = day)) +
+  labs(title="Citi bike trips in Brooklyn by week",
+       subtitle = "5-week period in September-October 2019",
+       x="",
+       y="Trip Count") +
+  plotTheme() +
+  theme(legend.position = "bottom",
+        panel.grid.major = element_blank(),
+        panel.border = element_blank(),
+        panel.background = element_rect(fill = "#eeeeee")
+        )
+
+
+```
+
+
+
+```{r fig.height=8, fig.width=12}
+
+# set the location of stations for labeling
+PennSt <- c(-73.992358, 40.750046)
+Ph30St <- c(-75.182327, 39.956565)
+
+
+# get station points and aggregate delay
+delaysPoints <- delaysPanelSpatial %>%
+  group_by(week, station) %>%
+  summarize(aggrDelays = sum(delayAggr)) %>%
+  ungroup() 
+
+
+njCounties <- stateCounties %>%
+  filter(GEOID < 35000)
+
+otherCounties <- stateCounties %>%
+  filter(GEOID %in% c(36061,36071,36087,42017,42091,42101))
+
+
+# side by side graduate symbol maps 
+delaysPoints %>% 
+  ggplot() +
+  geom_sf(data=njCounties, colour = "#222222", fill = "#2f2f2f") +               #  BASE MAP goes here
+  geom_sf(data=njLines, colour = "#888888", fill = NA, size=0.66) +               #  BASE MAP goes here
+  geom_sf(pch = 21,
+          colour = 'NA',
+          alpha = 0.66,
+          aes(size = aggrDelays,
+          fill = aggrDelays)) +
+  facet_wrap(~week, ncol = 5) +
+  scale_fill_viridis_c(option = "plasma") +
+  scale_size_continuous(
+    range = c(0,4)) +
+  labs(title="NJ Rail: Amount of delay per station",
+       subtitle = "September-October 2019") +
+  guides(size = F,
+         fill=guide_colorbar(title="aggregate delay per station", barwidth = 20)) +
+  mapTheme() +
+  theme(legend.position = "bottom",
+        panel.border = element_blank(),
+        panel.background = element_rect(fill = "#222222"),
+        panel.grid = element_blank(),
+        strip.background = element_rect(fill = "#222222"),
+        strip.text.x = element_text(size = 12, color = '#eeeeee', hjust=0.01))
+
+
+
+```
+
+
+
+```{r fig.height=15, fig.width=12, results='markup'}
+
+# filter bike data for just september 24 2019
+week39 <- njData %>%
+  filter(week == 39 & dotw == "Tue")
+
+# create empty panel with all station-time combinations
+week39Panel <-
+  expand.grid(
+    interval15 = unique(week39$interval15),
+    station = as.character(unique(njData$station)))
+
+# alternate mode of counting trips
+week39Trips <- njData %>%
+  filter(week == 39) %>%
+  group_by(station, interval15) %>%
+  summarize(aggrDelay = sum(delay, na.rm=T))
+
+# put data together for sept. 24
+njAnimationData <-
+  week39Trips %>%
+  right_join(week39Panel) %>%
+  mutate(id = as.integer(str_extract(station, '[0-9]*'))) %>%
+  left_join(stations, by=c("id" = "stop_id")) %>%
+  st_sf()
+
+# create map per 15 minute interval
+animation <- 
+  njAnimationData %>% 
+  ggplot() +
+  geom_sf(data=njCounties, colour = "#222222", fill = "#2f2f2f") +
+  geom_sf(data=njLines, colour = "#666666", fill = NA, size=0.5) +               #  BASE MAP goes here
+  geom_sf(pch = 21,
+          colour = 'NA',
+          alpha = 0.8,
+          aes(size = aggrDelay,
+          fill = aggrDelay)) +
+  scale_fill_viridis_c(option = "plasma") +
+  scale_size_continuous(
+    range = c(0,7)) +
+  labs(title="NJ Rail: Amount of delay per station",
+       subtitle = "15 minute intervals: {current_frame}") +
+  guides(size = F,
+         fill=guide_colorbar(title="trips per station", barwidth = 10)) +
+  transition_manual(interval15) +
+  mapTheme() +
+  theme(legend.position = "bottom",
+        panel.border = element_blank(),
+        panel.background = element_rect(fill = "#222222"),
+        panel.grid = element_blank(),
+        strip.background = element_rect(fill = "#222222")
+        )
+
+# plot animation
+animate(animation, duration=20, renderer = gifski_renderer())
+
+
+
+```
+
+
+
+```{r temperature, fig.height=3.5, fig.width=12}
+
+
+# temperature as a function of delays by week
+delaysPanel %>%
+  group_by(interval60) %>% 
+  summarize(meanDelay = mean(delayAggr),
+            temperature = first(Temperature)) %>%
+  mutate(week = week(interval60)) %>%
+
+  
+  ggplot(aes(temperature, meanDelay)) + 
+  geom_point(aes(color=temperature)) +
+  scale_color_gradient(low="#1b98e0", high="red") +
+  geom_smooth(method = "lm", se= FALSE, color='#ffffff') +
+  facet_wrap(~week, ncol=5) + 
+  labs(title="NJ Rail delays as a fuction of temperature by week",
+         subtitle='September-October 2019',
+         x="Temperature", y="Mean Trip Count") +
+  plotTheme() +
+  theme(panel.border = element_blank(),
+        panel.background = element_rect(fill = "#222222"),
+        panel.grid = element_blank(),
+        panel.grid.major = element_blank(),
+        strip.background = element_rect(fill = "#222222"),
+        strip.text.x = element_text(size = 12, color = '#ffffff', hjust=0.01)
+        )
+
+
+
+```
+
+
+
+```{r precipitation chart, fig.height=4, fig.width=4}
+
+delaysPanel %>%
+  group_by(interval60) %>% 
+  summarize(meanDelay = mean(delayAggr),
+            Precipitation = first(Precipitation)) %>%
+  mutate(isPrecip = ifelse(Precipitation > 0,"Rain/Snow", "None")) %>%
+  group_by(isPrecip) %>%
+  ggplot(aes(isPrecip, meanDelay, fill=isPrecip)) + 
+  geom_bar(stat = "identity") +
+  scale_fill_manual(values = c("None" = "#222222",
+                               "Rain/Snow" = "#1b98e0")) +
+  labs(title='Variation of delay by precipitation',
+           x="Precipitation", y="Mean Delay Time (min)") +
+  plotTheme() +
+  theme(legend.position = "none",
+        panel.border = element_blank(),
+        panel.background = element_rect(fill = "#ffffff"),
+        panel.grid.major.x = element_blank(),
+        strip.text.x = element_text(size = 12)
+        )
+
+
+```
+
+### Modeling
+
+```{r }
+
+# Model A - just time (hour), day of the week and weather
+reg1 <- lm(delayAggr ~
+             hour(interval60) +
+             dotw +
+             Temperature,
+           data = delaysTrain)
+
+# Model B - just space (station), day of the week and weather 
+reg2 <- lm(delayAggr ~
+             station +
+             GEOID +
+             dotw + Temperature,
+           data = delaysTrain)
+
+# Model C - time and space
+reg3 <- lm(delayAggr ~
+             station +
+             GEOID +
+             hour(interval60) +
+             dotw +
+             Temperature,
+           data = delaysTrain)
+
+# Model D - Lag variables
+reg4 <- lm(delayAggr ~
+             station +
+             GEOID +
+             hour(interval60) +
+             dotw +
+             Temperature +
+             lagHour +
+             lag2Hours +
+             lag3Hours +
+             lag12Hours +
+             lag1day,
+           data = delaysTrain)
+
+
+```
+
+
+
+```{r }
+
+delaysTest_weekNest <- 
+  as.data.frame(delaysTest) %>%
+  nest(-week) 
+
+
+# define function to return predictions based on a dataset of nested tibbles and a regression model
+modelPred <- function(dat, fit){
+   pred <- predict(fit, newdata = dat)}
+
+# return predictions into a tibble of tibbles
+weekPredictions <- 
+  delaysTest_weekNest %>% 
+    mutate(A_Time_FE = map(.x = data, fit = reg1, .f = modelPred),
+           B_Space_FE = map(.x = data, fit = reg2, .f = modelPred),
+           C_Space_Time_FE = map(.x = data, fit = reg3, .f = modelPred),
+           D_Space_Time_Lags = map(.x = data, fit = reg4, .f = modelPred))
+
+
+weekPredictions <- weekPredictions %>%
+    gather(Regression, Prediction, -data, -week) %>%                        # turn into long form by week
+    mutate(Observed = map(data, pull, delayAggr),
+           absoluteError = map2(Observed, Prediction, ~abs(.x - .y)),       # apply absolute error function
+           MAE = map_dbl(absoluteError, mean),                              # get mean of absolute error
+           sd_AE = map_dbl(absoluteError, sd))                              # get SD of absolute error
+
+
+
+```
+
+
+
+
+```{r MAE charts, fig.height=4.5, fig.width=6}
+
+# chart Mean Absolute Errors by model specifications and Week
+weekPredictions %>%
+  dplyr::select(week, Regression, MAE) %>%
+  gather(Variable, MAE, -Regression, -week) %>%
+  ggplot(aes(week, MAE)) + 
+  geom_bar(aes(fill = Regression), alpha=.9, position = "dodge", stat="identity") +
+  scale_x_continuous(breaks = c(42,43)) +
+  scale_fill_manual(values = palette5) +
+  labs(title = "Mean Absolute Errors",
+       subtitle = 'by model specification and week') +
+  plotTheme() +
+  theme(legend.position = "bottom",
+        panel.border = element_blank(),
+        panel.background = element_rect(fill = "#222222"),
+        panel.grid = element_blank(),
+        panel.grid.major.x =  element_blank(),
+        strip.text.x = element_text(size = 12)
+        )
+
+
+
+```
+
+
+```{r validation: plot predicted and observed by hour}
+
+pred_time_plot_data <- 
+  weekPredictions %>%
+  mutate(
+    interval60 = map(data, pull, interval60),
+    station = map(data, pull, station),
+  ) %>%
+  dplyr::select(interval60, station, Observed, Prediction, Regression) %>%
+  unnest() %>%
+  rename(Predicted = Prediction) %>%
+  gather(variable, value, -Regression, -interval60, -station) %>%
+  group_by(Regression, variable, interval60) %>%
+  summarize(value = mean(value))
+
+filter(pred_time_plot_data) %>%
+  ggplot(aes(interval60, value, color = variable)) +
+  geom_line() +
+  # geom_vline(xintercept = halloween, linetype = "dotted") +
+  # geom_vline(data = mondays, aes(xintercept = hour), size = 0.25) +
+  facet_wrap(~Regression, ncol = 1) +
+  # scale_color_manual(values = palette2) +
+  labs(title = "Predicted and observed trips by hour",
+       subtitle = "Solid lines for Mondays; dotted line for Halloween",
+       x = "Trips",
+       y = "Date") +
+  plotTheme +
+  theme(legend.position = "bottom")
+
+```
+
+
+```{r errorMaps, fig.height=12, fig.width=12}
+
+# select best regression model and get value by station (or tract)
+errors <- weekPredictions %>%
+  filter(Regression == "D_Space_Time_Lags") %>% 
+  unnest %>%
+  st_sf()
+
+# get total MAE per weeks 42 and 43
+errorWeek <- errors %>%
+  dplyr::select(station, absoluteError, week, geometry) %>%
+  gather(Variable, Value, -station, -week, -geometry) %>%
+    group_by(Variable, station, week) %>%
+    summarize(MAE = mean(Value))
+
+
+# get MAE per hour on Tuesday October 14
+errorDay <- errors %>%
+    dplyr::select(station,
+                  absoluteError,
+                  geometry,
+                  interval60)%>%
+    gather(Variable,
+           Value,
+           -interval60,
+           -station,
+           -geometry) %>%
+    filter(wday(interval60, label = TRUE) == "Tue" & week(interval60) == 42) %>%
+    group_by(hour = hour(interval60), station) %>%
+    summarize(MAE = mean(Value)) 
+
+
+# map of error by weeks
+errorWeek %>%
+  ggplot() +
+  geom_sf(data=njCounties, colour = "#222222", fill = "#3a3a3a") +
+  geom_sf(data=njLines, colour = "#888888", fill = NA, size=0.66) +               #  BASE MAP goes here
+  geom_sf(pch = 21,
+          colour = 'NA',
+          alpha = 0.75,
+          aes(size = MAE,
+          fill = MAE)) +
+  geom_text(
+    label="NY Penn St.", 
+    x=PennSt[1]+.05,
+    y=PennSt[2]-.05,
+    size = 3,
+    color = "#eeeeee"
+  ) +
+  geom_text(
+    label="Phl 30th St.", 
+    x=Ph30St[1]-.05,
+    y=Ph30St[2]-.05,
+    size = 3,
+    color = "#eeeeee"
+  ) +
+  facet_wrap(~week, ncol = 2) +
+  scale_fill_gradient(low='#91bfdb',
+                       high='#fc8d59',
+                      guide='colorbar') +
+  scale_size_continuous(range = c(0,6)) +
+  labs(title="Mean Absolute Error per week and station",
+       subtitle = "NJ Rail delays by station") +
+  guides(size=F,
+         fill=guide_colorbar(title="MAE", barwidth = 20)) +
+  mapTheme() +
+  theme(legend.position = "bottom",
+        panel.border = element_blank(),
+        panel.background = element_rect(fill = "#222222"),
+        panel.grid = element_blank(),
+        strip.background = element_rect(fill = "#222222"),
+        strip.text.x = element_text(size = 16, color = '#ffffff', hjust=0.01)
+        )
+
+
+```
+
+
+```{r error map day, fig.height=18, fig.width=12}
+
+# make a map of MAES by hour of day6
+errorDay %>%
+  ggplot() +
+  geom_sf(data=njCounties, colour = "#222222", fill = "#3a3a3a") +
+  geom_sf(data=njLines, colour = "#888888", fill = NA, size=0.66) +               #  BASE MAP goes here
+  geom_sf(pch = 21,
+          colour = 'NA',
+          alpha = 0.75,
+          aes(size = MAE,
+          fill = MAE)) +
+  facet_wrap(~hour, ncol = 6) +
+  scale_fill_gradient(low='#91bfdb',
+                       high='#fc8d59',
+                      guide='colorbar') +
+  scale_size_continuous(range = c(0,4)) +
+  labs(title="Mean Absosulte Error per hour and station",
+       subtitle = "NJ Rail Lines - September 24th 2019") +
+  guides(size=F,
+         fill=guide_colorbar(title="MAE", barwidth = 20)) +
+  mapTheme() +
+  theme(legend.position = "bottom",
+        panel.border = element_blank(),
+        panel.background = element_rect(fill = "#222222"),
+        panel.grid = element_blank(),
+        strip.background = element_rect(fill = "#222222"),
+        strip.text.x = element_text(size = 12, color = '#ffffff', hjust=0.05)
+        )
+
+
+```
+
+
+
+
+```{r LOGO CV, eval=F}
+
+# TODO: fix cv errors, incl this one:
+# Quitting from lines 885-989 (MUSA-508_HW7.Rmd) 
+# Error: Problem with `filter()` input `..1`.
+# ℹ Input `..1` is `dataset[[id]] != thisFold`.
+# x Must extract column with a single valid subscript.
+# x Subscript `id` has size 186480 but must be size 1.
+
+
+# CrossValidations: by neighborhood or census tract.
+# define cross validation formula
+crossValidate <- function(dataset, id, dependentVariable, indVariables, indVariableName) {
+  
+  allPredictions <- data.frame()
+  cvID_list <- unique(dataset[[id]])
+  
+  for (i in cvID_list) {
+    
+    thisFold <- i
+    cat("This hold out fold is", thisFold, "\n")
+    
+    fold.train <- filter(dataset, dataset[[id]] != thisFold) %>% as.data.frame() %>% 
+      dplyr::select(id, geometry, indVariables, dependentVariable)
+    fold.test  <- filter(dataset, dataset[[id]] == thisFold) %>% as.data.frame() %>% 
+      dplyr::select(id, geometry, indVariables, dependentVariable)
+    
+    regression <-
+      lm(delayAggr ~ .,
+          data = fold.train %>% 
+            dplyr::select(-geometry, -id))
+    
+    thisPrediction <- 
+      mutate(fold.test, Prediction = predict(regression, fold.test, type = "response"))
+    
+    allPredictions <-
+      rbind(allPredictions, thisPrediction)
+    
+  }
+  return(st_sf(allPredictions))
+}
+
+
+# random LOGO-CV
+regVarsRand <-  c('GEOID',
+              'interval60',
+              'dotw',
+              'Temperature',
+              'lagHour',
+              'lag2Hours',
+              'lag3Hours',
+              'lag12Hours',
+              'lag1day')
+
+
+# spatial (counties) LOGO CV          ## ERROR: "no simple features column present", might need to join back the station points???
+
+
+regCVrandom <- crossValidate(
+  dataset = z,
+  id = "cvID",
+  dependentVariable = "delayAggr",
+  indVariables = regVarsRand) %>%
+    dplyr::select(cvID = cvID, delayAggr, Prediction, geometry)
+
+
+
+# Run four regressions by model
+# regression with LOGO-CV and no spatial features 
+
+regVars <-  c('interval60',
+              'dotw',
+              'Temperature',
+              'lagHour',
+              'lag2Hours',
+              'lag3Hours',
+              'lag12Hours',
+              'lag1day')
+
+# Counties LOGO-CV
+regCVcounties <- crossValidate(
+  dataset = delaysPanelSpatial,
+  id = "GEOID",
+  dependentVariable = "delayAggr",
+  indVariables = regVars) %>%
+    dplyr::select(cvID = GEOID, delayAggr, Prediction, geometry)
+
+# TODO: 
+# "Line 885: 
+
+# compute errors and MAE by station/hour
+regCV1 <- regCVrandom %>%
+  st_drop_geometry() %>%
+  mutate(regression = 'spatial CV neighborhoods',             # identify regression
+         interval60 = delaysPanelSpatial$interval60,            # join time back
+         week = week(interval60)) %>% 
+  mutate(station = delaysPanelSpatial$station) %>%              # join stations back
+  rename('Observed' = delayAggr) %>%
+  mutate(absoluteError = abs(Observed - Prediction))          # get absolute error
+
+
+
+
+# compute errors and MAE by station/hour
+regCV2 <- regCVcounties %>% 
+  st_drop_geometry() %>%
+  mutate(regression = 'spatial CV tracts',                    # identify regression
+         interval60 =  delaysPanelSpatial$interval60,           # join time back
+         week = week(interval60)) %>%       
+  mutate(station = delaysPanelSpatial$station) %>%              # join stations back
+  rename('Observed' = delayAggr) %>%
+  mutate(absoluteError = abs(Observed - Prediction))          # get absolute error
+
+
+```
+
+
+
+```{r }
+
+
+
+
+
+```
+
+
+

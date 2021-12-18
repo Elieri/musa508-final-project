@@ -1,0 +1,1128 @@
+---
+title: "HEADWAY - a tool for predicting train delays"
+author: "Elisabeth Ericson & Adrián León"
+date: "December 2021"
+output: 
+  html_document: 
+    toc: true
+    toc_float: true
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = T, warning = F, error = F, message = F, 
+                      results = F, cache = T, fig.align = "center")
+```
+
+
+```{r libraries & options}
+
+library(tidyverse)
+library(sf)
+library(tigris)
+library(lubridate)
+library(riem)
+library(imputeTS)
+library(gridExtra)
+library(caret)
+library(kableExtra)
+
+# set options
+options(scipen = 999) # block scientific notation
+options(tigris_class = "sf")
+set.seed(508)
+
+# set coordinate system
+mapCRS <- "EPSG:4326"
+
+# set color schemes
+themeLightBlue <- "#91bfdb"
+themeMedBlue <- "#1b98e0"
+themeOrange <- "#fc8d59"
+themeDarkGray <- "#222222"
+
+palette2 <- c(themeLightBlue, themeOrange)
+
+palette5 <- c("#eff3ff","#bdd7e7","#6baed6","#3182bd","#08519c")
+
+palette8 <- 
+  c("#f7fbff", "#deebf7", "#c6dbef", "#9ecae1", "#6baed6", "#4292c6", 
+    "#2171b5", "#08519c")
+
+# set map styling options
+mapTheme <-
+  theme(
+    axis.text = element_blank(),
+    axis.ticks = element_blank(),
+    legend.position = "bottom",
+    legend.title = element_blank(),
+    panel.background = element_rect(fill = "#222222"),
+    panel.grid = element_blank(),
+    plot.title = element_text(face = "plain"),
+    plot.subtitle = element_text(face = "italic"),
+    plot.caption = element_text(hjust = 0.5),
+    strip.background = element_rect(fill = "#222222"),
+    strip.text.x = element_text(size = 14, color = '#ffffff', hjust=0.01)
+  )
+
+# set plot styling options
+plotTheme <-
+  theme(
+    axis.ticks = element_blank(),
+    legend.position = "bottom",
+    legend.title = element_blank(),
+    plot.background = element_blank(),
+    panel.background = element_rect(fill = "#222222"),
+    panel.grid = element_blank(),
+    panel.grid.major = element_line(color = "gray25", size = 0.1),
+    panel.grid.minor = element_line(color = "gray25", size = 0.1),
+    plot.title = element_text(face = "plain"),
+    plot.subtitle = element_text(face = "italic"),
+    plot.caption = element_text(hjust = 0.5),
+    strip.background = element_rect(fill = "#222222"),
+    strip.text.x = element_text(size = 14, color = '#ffffff', hjust=0.01)
+  )
+
+
+```
+
+
+## Introduction
+
+Most of us can relate to standing on a platform checking and re-checking the time with mounting frustration, our eyes darting between our phones and the darkened tunnel where, maddeningly, there's _still_ no sign of headlights. This scenario was the inspiration for HEADWAY, a spatiotemporal forecasting tool to help transit agencies predict delays before they happen, improve performance, and keep travelers from giving up and calling a Lyft.
+
+Predicting train delays is not an easy task. Intuitively, we might expect delays to happen more often at rush hour, or in rainy weather -- but does that hold true? To test these assumptions, and to develop the most robust possible algorithm, we tested seven different supervised machine learning models drawn from historical NJ Transit schedules and on-time performance data, along with a variety of weather records and other features related to system characteristic.
+
+For our pilot project, we trained these seven time-series linear regression models on data from the 11 NJ Transit lines operating across the tri-state area for which scheduled and actual departure data was available. To create a baseline model unaffected by the disruptions in service caused by the COVID-19 pandemic, we focused on a five-week period from September 2019 to October 2019. With additional time and resources, we expect to improve the model considerably by incorporating more extensive training data along with more sophisticated algorithms.
+
+[Headway app demo](https://www.youtube.com/watch?v=MkSLicajoOQ)
+
+***
+
+## Data
+
+Below, we describe the data sources we used and our approach to each of them.
+
+### Train delay data
+
+```{r }
+
+# read in train departures
+rawDepartures <- 
+  rbind(read.csv("data/2019_09.csv"), 
+        read.csv("data/2019_10.csv"))
+
+# read in station coordinates
+rawStations <- 
+  read_csv("data/stops.csv") %>%
+  st_as_sf(coords = c("stop_lon", "stop_lat")) %>%
+  st_set_crs("EPSG:4326")
+
+# get counties where NJ Transit operates (for cross-validation)
+rawCounties <- 
+  rbind(tigris::counties(state = 34),
+        tigris::counties(state = 36),
+        tigris::counties(state = 42)) %>%
+  dplyr::select(GEOID, NAME, geometry) %>%
+  st_transform(mapCRS)
+
+# read in rail line map
+njLines <- 
+  st_read("https://opendata.arcgis.com/datasets/e6701817be974795aecc7f7a8cc42f79_0.geojson") %>%
+  dplyr::select(-OBJECTID, -SE_ANNO_CAD_DATA, -SHAPE_Length)
+
+```
+
+We based on our analysis on an extract from a [dataset available on Kaggle](https://www.kaggle.com/pranavbadami/nj-transit-amtrak-nec-performance?select=2018_11.csv) containing detailed scheduled and actual departure-level data for Amtrak and NJ Transit trains between March 2018 and May 2020. As noted above, for our proof of concept, we focused on a time period from mid-October to mid-November 2019. Because the Amtrak data included actual departure times but no schedule information, there was insufficient information to compute delays, and we excluded the Amtrak trains from our analysis.
+
+Of the dozen NJ Transit lines represented in the dataset, 11 included sufficient data to include in our analysis. One of the 12, Meadowlands Rail, contained no schedule data and was therefore excluded.
+
+
+```{r data quality chart, fig.width=5.5, fig.height=4}
+
+lineStats <-
+  filter(rawDepartures, type == "NJ Transit") %>%
+  group_by(line) %>%
+  summarize(
+    total_records = n(),
+    delay_NA_pct = round(sum(is.na(delay_minutes)) / total_records, 3),
+    sequence_NA_pct = round(sum(is.na(stop_sequence)) / total_records, 3),
+    from_NA_pct = round(sum(is.na(from_id)) / total_records, 3),
+    to_NA_pct = round(sum(is.na(to_id)) / total_records, 3),
+    delay_mean = mean(delay_minutes, na.rm = T),
+    delay_median = median(delay_minutes, na.rm = T)
+  )
+
+systemStats <-
+  filter(rawDepartures, type == "NJ Transit") %>%
+  summarize(
+    total_records = n(),
+    delay_NA_pct = round(sum(is.na(delay_minutes)) / total_records, 3),
+    sequence_NA_pct = round(sum(is.na(stop_sequence)) / total_records, 3),
+    from_NA_pct = round(sum(is.na(from_id)) / total_records, 3),
+    to_NA_pct = round(sum(is.na(to_id)) / total_records, 3),
+    delay_mean = mean(delay_minutes, na.rm = T),
+    delay_median = median(delay_minutes, na.rm = T)
+  )
+
+ggplot(lineStats) +
+  geom_bar(aes(x = reorder(line, -delay_NA_pct), 
+               y = delay_NA_pct), 
+           stat = "identity", fill = themeLightBlue, alpha = 0.66) +
+  scale_y_continuous(labels = scales::percent_format()) +
+  coord_flip() +
+  geom_hline(yintercept = systemStats$delay_NA_pct, linetype = 2, 
+             color = "white") +
+  labs(title = "Missing schedule data by line",
+       subtitle = "Dashed line represents system average",
+       y = "Percent") +
+  theme(axis.title = element_blank()) +
+  plotTheme
+
+```
+
+```{r data cleaning}
+
+# isolate station geometries
+stations <-
+  dplyr::select(rawStations, station_id = stop_id, geometry) %>%
+  mutate(station_id = as.factor(station_id))
+
+# get counties by station (for cross-validation)
+stationsByCounty <-
+  stations %>%
+  st_join(rawCounties) %>%
+  st_drop_geometry() %>%
+  rename(county = NAME)
+
+# isolate NJ counties (for mapping)
+njCounties <-
+  filter(rawCounties, GEOID < 35000)
+  
+# clean departures dataset
+departures <-
+  # drop unneeded columns
+  dplyr::select(rawDepartures, -date, -actual_time, -type) %>%
+  # remove cancelled trains and trains with no schedule information
+  filter(!is.na(delay_minutes) & status != "cancelled") %>%
+  mutate(
+    # standardize existing features
+    train_id = as.factor(train_id),
+    from_id = as.factor(from_id),
+    to_id = as.factor(to_id),
+    scheduled_time = ymd_hms(scheduled_time),
+    # create line-level station identifier
+    line_station = paste(to, line, sep="_"),
+    # create new time features
+    week = isoweek(scheduled_time),
+    dotw = wday(scheduled_time, label = T),
+    hour = hour(scheduled_time),
+    interval60 = floor_date(scheduled_time, unit = "hour"),
+    interval15 = floor_date(scheduled_time, unit = "15 min")
+  ) %>%
+  rename(station_id = to_id,
+         station = to,
+         line_name = line) %>%
+  left_join(stationsByCounty)
+
+```
+
+
+### Weather data
+
+We retrieved granular data for a range of weather measures. In addition to temperature, precipitation in the last hour, and wind speed, we included visibility and a "peak wind" feature representing the strongest gusts in a given hour. (Our final model omitted the wind speed variable in favor of peak wind, as the latter performed slightly better, although the weather features generally turned out to be underwhelming.) In instances where records in our time series lacked temperature or precipitation data, we used linear interpolation to impute the missing values from the previous and subsequent records.
+
+The available weather data also included "ice accretion" over various time periods, which we were interested in experimenting with as a potential hazard to rail travel; however, no ice was recorded during the period we studied, and we did not include it in this model.
+
+
+```{r weather data, fig.height=8, fig.width=8}
+
+# load weather data
+weatherData <- 
+  riem_measures(
+    station = "EWR", date_start = "2019-09-01", date_end = "2019-11-02"
+  ) %>%
+  dplyr::select(
+    time = valid,
+    temperature = tmpf,
+    windspeed = sknt,
+    precip_1h = p01i,
+    visibility = vsby,
+    gust = gust,
+    peak_wind_gust
+  ) %>%
+  mutate(
+    interval60 = floor_date(time, unit = "hour"),
+    peak_wind = case_when(
+      peak_wind_gust > 0 ~ peak_wind_gust,
+      gust > 0 ~ gust,
+      windspeed >= 0 ~ windspeed
+    )
+  )
+
+# create weather panel, impute missing values, & engineer wind feature
+weatherPanel <-
+  weatherData %>%
+  group_by(interval60) %>%
+  summarize(
+    temperature = mean(temperature, na.rm = T),
+    precip_1h = mean(precip_1h, na.rm = T),
+    visibility = mean(visibility, na.rm = T),
+    windspeed = mean(windspeed, na.rm = T),
+    peak_wind = if_else(
+      !is.na(max(peak_wind)), max(peak_wind), max(windspeed)
+    )
+  ) %>%
+  mutate(
+    temperature_na = if_else(!is.nan(temperature), temperature, NA_real_),
+    temperature = na_interpolation(temperature_na),
+    precip_1h_na = if_else(!is.nan(precip_1h), precip_1h, NA_real_),
+    precip_1h = na_interpolation(precip_1h_na)
+  ) %>%
+  dplyr::select(-temperature_na, -precip_1h_na)
+
+# create charts by weather indicator
+grid.arrange(
+  ncol= 1,
+  top = "Weather data - Newark Liberty International Airport (EWR) - Sept & Oct 2019",
+  ggplot(weatherPanel, aes(interval60, precip_1h)) + geom_line(color = themeLightBlue) + 
+    labs(title = "Precipitation in last hour", x = "Hour", y = "Inches") + plotTheme,
+  ggplot(weatherPanel, aes(interval60, temperature)) + geom_line(color = themeLightBlue) +
+    labs(title = "Temperature", x = "Hour", y = "Degrees F") + plotTheme,
+  ggplot(weatherPanel, aes(interval60, windspeed)) + geom_line(color = themeLightBlue) +
+    labs(title = "Wind speed", x = "Hour", y = "Knots") + plotTheme,
+  ggplot(weatherPanel, aes(interval60, peak_wind)) + geom_line(color = themeLightBlue) +
+    labs(title = "Peak wind", x = "Hour", y = "Knots") + plotTheme,
+  ggplot(weatherPanel, aes(interval60, visibility)) + geom_line(color = themeLightBlue) +
+    labs(title = "Visibility", x = "Hour", y = "Miles") + plotTheme
+)
+
+
+```
+
+### The space-time process of train delays
+
+The spatial process of train delays is not necessarily the most intuitive to conceptualize, as it operates on at least two levels: the station where the train currently is, and the line along which it is traveling. Our model sought to acknowledge both of these spatial processes by predicting delays for each station of each line, for every hour interval in our study period. 
+
+In addition to using the "line-station" combination as our spatial unit of analysis, we sought to incorporate information about station characteristics that changed with time: our features included the number of trains scheduled at the station for each interval, as well as information about where in a line's sequence of stops it fell (this was _not_ identical from hour to hour, as trains were not always scheduled for the same number of stops). We included these features with the hypothesis that delays might be more severe at times when stations and rails are more congested, and that a stop farther along in a line's sequence might be more likely to suffer from cumulative delays caused by problems earlier in the line.
+
+We were interested in including more detailed rail network and traffic data, including shared rights-of-way and freight movements, but were unable to explore this in the time available.
+
+
+```{r create station panel}
+
+# extract line and station info for line-station combos
+lineStationDetails <-
+  dplyr::select(departures, line_station, line_name, station_id, station, 
+                county, GEOID) %>%
+  group_by(line_station) %>%
+  unique()
+
+# create empty panel of all line-station and hour combinations
+emptyPanel <-
+  expand.grid(
+    interval60 = seq.POSIXt(min(departures$interval60), 
+                      max(departures$interval60), by = "hour"),
+    line_station = unique(departures$line_station)
+  ) %>%
+  left_join(lineStationDetails)
+
+# compute delay minutes and trains per line-station per hour
+lineStationDelays <- 
+  departures %>%
+  group_by(interval60, line_station) %>%
+  summarize(
+    line_trains = n(),
+    min_sequence = min(stop_sequence),
+    max_sequence = max(stop_sequence),
+    mean_sequence = mean(stop_sequence),
+    total_delay = sum(delay_minutes),
+    per_train_delay = if_else(
+      line_trains > 0, total_delay / line_trains, 0
+    )
+  )
+
+# create station panel
+lineStationPanel <-
+  left_join(emptyPanel, lineStationDelays) %>%
+  mutate(
+    line_trains = replace_na(line_trains, 0),
+    no_trains = if_else(line_trains == 0, T, F),
+    min_sequence = replace_na(min_sequence, 0),
+    max_sequence = replace_na(max_sequence, 0),
+    mean_sequence = replace_na(mean_sequence, 0),
+    total_delay = replace_na(total_delay, 0),
+    per_train_delay = replace_na(per_train_delay, 0),
+    week = isoweek(interval60),
+    day = factor(wday(interval60, label = T), ordered = F),
+    hour = as.factor(hour(interval60))
+  ) %>%
+  left_join(weatherPanel, by = "interval60") %>%
+  arrange(line_station, interval60) %>%
+  mutate(
+    lag_1h = dplyr::lag(per_train_delay, 1),
+    lag_2h = dplyr::lag(per_train_delay, 2),
+    lag_3h = dplyr::lag(per_train_delay, 3),
+    lag_4h = dplyr::lag(per_train_delay, 4),
+    lag_12h = dplyr::lag(per_train_delay, 12),
+    lag_24h = dplyr::lag(per_train_delay, 24),
+    lag_1wk = dplyr::lag(per_train_delay, 168),
+    lag_2wk = dplyr::lag(per_train_delay, 336),
+    lag_3wk = dplyr::lag(per_train_delay, 504)
+  ) %>%
+  ungroup() %>%
+  filter(week %in% seq(39, 43) & no_trains == F)
+
+```
+
+
+***
+
+## Exploratory analysis
+
+After building the panel, we split our data into a three-week training set and a two-week test set and conducted exploratory analysis on the training set to inform our model design. We trained our model on the three weeks between Monday, September 23 and Sunday, October 13, 2019, and tested it on the two weeks between Monday, October 14 and Sunday, October 27, 2019.
+
+```{r create training and test sets}
+
+# training: weeks 39 to 41
+training <- filter(lineStationPanel, week %in% seq(39, 41))
+
+# test: weeks 42 and 43
+test <- filter(lineStationPanel, week %in% seq(42, 43))
+
+```
+
+### Delays by time
+
+The first plot simply shows the mean delay per train departure during the training and test periods. At once, we can see that mean delays are cyclical to a noteworthy extent, but also that they are punctuated by more dramatic spikes that don't seem to follow an obvious pattern. The more cyclical delays, at first glance, seem to be higher in the evening than in the morning, and at least slightly higher on weekends than during the week.
+
+```{r plot delays across time, fig.height=2.5, fig.width=6}
+
+mondays <-
+  mutate(lineStationPanel, monday = ifelse(day == "Mon", hour(interval60) == 1, 0)) %>%
+  filter(monday != 0) %>%
+  dplyr::select(interval60) %>%
+  distinct()
+
+rbind(
+  mutate(training, Legend = "Training"),
+  mutate(test, Legend = "Test")
+) %>%
+  group_by(Legend, interval60) %>%
+  summarize(per_train_delay = mean(per_train_delay)) %>%
+  ungroup() %>%
+  ggplot(aes(interval60, per_train_delay, color = Legend)) +
+    geom_line() +
+    scale_color_manual(values = palette5) +
+    # geom_vline(xintercept = halloween, linetype = "dotted") +
+    geom_vline(data = mondays, aes(xintercept = interval60), 
+               size = 0.25, color = "white") +
+    labs(
+      title = "Mean per-train delays: October-November",
+      subtitle = "Vertical lines indicate Mondays",
+      x = "Date",
+      y = "Minutes"
+    ) +
+    plotTheme
+
+
+```
+
+
+### Delays by line
+
+The paired charts below show that, with one glaring exception, average delays are fairly similar across NJ Transit's lines, with most lines' mean and median delay falling within a minute of each other.
+
+The line with by far the highest mean delay -- and yet somehow also a median delay of 0 -- is the Atlantic City Line, which connects Philadelphia to Atlantic City. According to [Wikipedia](https://en.wikipedia.org/wiki/Atlantic_City_Line), the Atlantic City Line is the only NJ Transit line not to offer traditional rush hour service; it also shares tracks with SEPTA, Amtrak, and PATCO, as well as (briefly) with Conrail freight trains.
+
+The line with by far the best on-time performance is the Princeton Shuttle, also known as the [Dinky](https://www.njtransit.com/dinky), which runs between downtown Princeton, NJ and Princeton University with no intervening stops. 
+
+```{r average delays by line}
+
+meanDelayPlot <-
+  ggplot(drop_na(lineStats)) +
+    geom_bar(aes(x = reorder(line, -delay_mean), 
+                 y = delay_mean), 
+             stat = "identity", fill = themeLightBlue, alpha = 0.66) +
+    coord_flip() +
+    geom_hline(yintercept = systemStats$delay_mean, linetype = 2, 
+               color = "white") +
+    labs(title = "Mean delay by line",
+         subtitle = "minutes; dashed line represents system average",
+         y = "Minutes") +
+    theme(axis.title = element_blank()) +
+    plotTheme
+
+medianDelayPlot <-
+  ggplot(drop_na(lineStats)) +
+    geom_bar(aes(x = reorder(line, -delay_median), 
+                 y = delay_median), 
+             stat = "identity", fill = themeLightBlue, alpha = 0.66) +
+    coord_flip() +
+    expand_limits(y = max(lineStats$delay_mean, na.rm = T)) +
+    geom_hline(yintercept = systemStats$delay_median, linetype = 2, 
+               color = "white") +
+    labs(title = "Median delay by line",
+         subtitle = "",
+         y = "Minutes") +
+    theme(axis.title = element_blank()) +
+    plotTheme
+
+grid.arrange(meanDelayPlot, medianDelayPlot, ncol = 2)
+
+```
+
+### Delays by station
+
+Mapping delays by station gives further insight into how delays are distributed spatially. Interestingly, the delays on the Atlantic City Line are distributed throughout the entire line, and don't appear visibly worse at any particular station; meanwhile, the lines converging on NYC show more spatial variation in the distribution of delays within each line.
+
+```{r delays by station, fig.width=6, fig.height=6}
+
+# set station coordinates for map labels
+PennSt <- c(-73.992358, 40.750046)
+Ph30St <- c(-75.182327, 39.956565)
+
+# compute delays by station
+stationDelays <-
+  departures %>%
+  group_by(station_id, interval60) %>%
+  summarize(
+    trains = n(),
+    total_delay = sum(delay_minutes),
+    per_train_delay = total_delay / trains
+  ) %>%
+  group_by(station_id) %>%
+  summarize(
+    total_delay = mean(total_delay),
+    per_train_delay = mean(per_train_delay)
+  ) %>%
+  arrange(per_train_delay) %>%
+  left_join(stations, by = "station_id") %>%
+  st_sf()
+
+stationDelays %>%
+  ggplot() +
+  geom_sf(data = njCounties, colour = "#222222", fill = "#3a3a3a") +
+  geom_sf(data = njLines, colour = "#888888", fill = NA, size = 0.66) +
+  geom_sf(pch = 21,
+          colour = 'NA',
+          alpha = 0.75,
+          aes(size = per_train_delay,
+          fill = per_train_delay)) +
+  geom_text(
+    label="NY Penn St.", 
+    x=PennSt[1]+.05,
+    y=PennSt[2]-.05,
+    size = 3,
+    color = "#eeeeee"
+  ) +
+  geom_text(
+    label="Phl 30th St.", 
+    x=Ph30St[1]-.05,
+    y=Ph30St[2]-.05,
+    size = 3,
+    color = "#eeeeee"
+  ) +
+  scale_fill_gradient(low='#91bfdb',
+                       high='#fc8d59',
+                      guide='colorbar') +
+  scale_size_continuous(range = c(0,4)) +
+  labs(title="Delays per station",
+       subtitle = "Total and train average") +
+  guides(size="none",
+         fill=guide_colorbar(title="Minutes", barwidth = 10)) +
+  mapTheme
+
+```
+
+### Delays across space and time
+
+Mapping delays by line by hour sheds additional light on exactly where and when the worst delays are taking place. Interestingly, the very worst delays on the Atlantic City line occur a couple of hours after evening rush hour, rather than at its peak.
+
+```{r map mean delay by line, fig.height=18, fig.width=12}
+
+lineHourStats <-
+  departures %>%
+  group_by(line_name, hour) %>%
+  summarize(
+    delay_mean = mean(delay_minutes, na.rm = T),
+    delay_median = median(delay_minutes, na.rm = T)
+  ) %>%
+  mutate(
+    LINE_CODE = case_when(
+      line_name == "Atl. City Line" ~ "AC",
+      line_name == "Bergen Co. Line" ~ "BC",
+      line_name == "Gladstone Branch" ~ "GL",
+      line_name == "Main Line" ~ "ML",
+      line_name == "Meadowlands Rail" ~ "SL",
+      line_name == "Montclair-Boonton" ~ "MC",
+      line_name == "Morristown Line" ~ "ME",
+      line_name == "No Jersey Coast" ~ "NC",
+      line_name == "Northeast Corrdr" ~ "NE",
+      line_name == "Pascack Valley" ~ "PV",
+      line_name == "Princeton Shuttle" ~ "PRIN",
+      line_name == "Raritan Valley" ~ "RV"
+    )
+  ) %>%
+  arrange(delay_mean)
+
+njLinesMap <-
+  dplyr::select(njLines, LINE_CODE, geometry) %>%
+  left_join(lineHourStats) %>%
+  filter(!is.na(delay_mean))
+
+lineStats %>%
+  ggplot() +
+  geom_sf(data=njCounties, colour = "#222222", fill = "#3a3a3a") +
+  geom_sf(data=njLinesMap,
+          alpha = 0.75,
+          aes(size = delay_mean,
+            color = delay_mean),
+          lineend = "round") +
+  geom_text(
+    label="NY Penn St.", 
+    x=PennSt[1]+.05,
+    y=PennSt[2]-.05,
+    size = 3,
+    color = "#eeeeee"
+  ) +
+  geom_text(
+    label="Phl 30th St.", 
+    x=Ph30St[1]-.05,
+    y=Ph30St[2]-.05,
+    size = 3,
+    color = "#eeeeee"
+  ) +
+  facet_wrap(~hour, ncol = 6) +
+  scale_color_gradient(low='#91bfdb',
+                       high='#fc8d59',
+                      guide='colorbar') +
+  scale_size_continuous(range = c(0,6)) +
+  labs(title="Delays per line",
+       subtitle = "NJ Rail mean delays by line") +
+  guides(size="none",
+         color=guide_colorbar(title="Minutes", barwidth = 20)) +
+  mapTheme
+
+```
+
+### How does weather affect delays? (Does it?)
+
+We were surprised to find effectively no correlation whatsoever between train delays and any of the weather conditions we tested. Our final model did include the temperature, precipitation, visibility, and peak wind features because they improved predictions _very_ marginally, and most were highly statistically significant when combined with other features in a regression; however, they were nowhere near as influential as we might have thought.
+
+On reflection, this makes some sense. The extreme weather most likely to cause severe train delays (along with cancellations, which we didn't look at) is by definition rare*, and our model was trained on a very limited time period without any weather events noteworthy enough to show up in the data. In other words: We should not conclude from this that weather does not affect train delays at all, but ordinary, day-to-day weather variation does not appear to have a clear linear relationship with train delays.
+
+* Obligatory climate change caveat, "though of course less so by the day," etc.
+
+
+```{r weather correlations, fig.height=8, fig.width=6}
+
+weatherVars <- 
+  c("temperature", "precip_1h", "visibility", "windspeed", "peak_wind")
+
+weatherPlotData <-
+  filter(training, no_trains == F) %>%
+  dplyr::select(per_train_delay, all_of(weatherVars)) %>%
+  gather(variable, value, -per_train_delay)
+
+write.csv(weatherPlotData, 'weather_delays.csv')
+
+weatherCorrelations <-
+  group_by(weatherPlotData, variable) %>%
+  summarize(correlation = round(cor(value, per_train_delay), 2))
+
+ggplot(weatherPlotData, aes(value, per_train_delay)) +
+  geom_point(size = 0.5, color = themeLightBlue, alpha = 0.66) +
+  geom_smooth(method = "lm", se = FALSE, color = "white") +
+  geom_label(data = weatherCorrelations,
+            aes(label = paste("r = ", round(correlation, 2))),
+            x = Inf, y = Inf, vjust = 1.5, hjust = 1.1, 
+            label.size = 0, color = "white", fill = themeDarkGray) +
+  facet_wrap(~variable, ncol = 1, scales = "free_x") +
+  labs(title = "Train delays by weather conditions",
+       subtitle = "Average delay per departure, September 23 to October 13, 2019",
+       y = "Minutes",
+       x = "",
+       caption = 
+       "Temperature in degrees F; last hour's precipitation in inches; 
+       wind speed and peak wind in knots; visibility in miles") +
+  plotTheme
+
+```
+
+
+***
+
+## Model development
+
+In developing our model, we broadly divided the features we included into five categories, which we tested in different combinations to arrive at the seven models presented here, including the one we ultimately settled on. (Note that we tested many more than seven models, but for simplicity's sake we have streamlined the presentation here into the main conceptual approaches.)
+
+The feature categories:
+
+- **Time**, represented by day of week and hour of day
+- **Space**, represented by station and line
+- **Weather**, represented by temperature, precipitation in the last hour, visibility, and peak wind
+- **System**, represented by number of trains scheduled, mean stop number in a line's sequence, and max stop number in a line's sequence
+- **Lag**, represented by lagged delays either hourly (one, two, three, four, 12, and 24 hours) or weekly (one, two, and three weeks)
+
+The models:
+
+**A.** Time alone
+**B.** Space alone
+**C.** Space and time
+**D.** Space, time, and weather
+**E.** Space, time, weather, and system features
+**F.** Space, time, weather, system features, and hourly lag
+**G.** Space, time, weather, system features, and weekly lag
+
+We note that, while the examples we studied previously included weather in all the models, we chose to leave weather out of the first three models and only introduce it in the fourth, in an attempt to truly isolate the contributions of the various groups of features.
+
+```{r model development}
+
+timeVars <- c("hour", "day")
+
+spaceVars <- c("line_station")
+
+weatherVars <- 
+  c("temperature", "precip_1h", "visibility", "peak_wind")
+
+hourlyLagVars <- c("lag_1h", "lag_2h", "lag_3h", "lag_4h", "lag_12h", "lag_24h")
+
+systemVars <- c("line_trains", "max_sequence", "mean_sequence")
+
+weeklyLagVars <- c("lag_1wk", "lag_2wk", "lag_3wk")
+
+# model A - time
+timeModel <- as.formula(
+  paste("per_train_delay",
+        paste(timeVars,
+              collapse = " + ", sep = " + "),
+        sep = " ~ "))
+
+reg1 <- lm(timeModel, data = training)
+
+# model B - space
+spaceModel <- as.formula(
+  paste("per_train_delay",
+        paste(spaceVars,
+              collapse = " + ", sep = " + "),
+        sep = " ~ "))
+
+reg2 <- lm(spaceModel, data = training)
+
+# model C - time and space
+spaceTimeModel <- as.formula(
+  paste("per_train_delay",
+        paste(timeVars,
+              spaceVars,
+              collapse = " + ", sep = " + "),
+        sep = " ~ "))
+
+reg3 <- lm(spaceTimeModel, data = training)
+
+# model D - time, space, and weather
+weatherModel <- as.formula(
+  paste("per_train_delay",
+        paste(weatherVars,
+              timeVars,
+              spaceVars, 
+              collapse = " + ", sep = " + "),
+        sep = " ~ "))
+
+reg4 <- lm(weatherModel, data = training)
+
+# model E - time, space, weather, and system features
+systemModel <- as.formula(
+  paste("per_train_delay",
+        paste(systemVars,
+              weatherVars,
+              timeVars,
+              systemVars,
+              spaceVars,
+              collapse = " + ", sep = " + "),
+        sep = " ~ "))
+
+reg5 <- lm(systemModel, data = training)
+
+# model F - hourly lag
+hourlyLagModel <- as.formula(
+  paste("per_train_delay",
+        paste(systemVars,
+              weatherVars,
+              timeVars,
+              hourlyLagVars,
+              spaceVars,
+              collapse = " + ", sep = " + "),
+        sep = " ~ "))
+
+reg6 <- lm(hourlyLagModel, data = training)
+
+# model G - weekly lag
+weeklyLagModel <- as.formula(
+  paste("per_train_delay",
+        paste(systemVars,
+              weatherVars,
+              timeVars,
+              weeklyLagVars,
+              spaceVars,
+              
+              collapse = " + ", sep = " + "),
+        sep = " ~ "))
+
+reg7 <- lm(weeklyLagModel, data = training)
+
+```
+
+
+***
+
+## Results
+
+We generated predictions for all seven models and compare the results below. We then cross-validated the best-performing model.
+
+
+```{r generate predictions for test set}
+
+# define function to generate predictions
+modelPred <- function(data, fit) {
+  predictions <- predict(fit, newdata = data)
+}
+
+# nest test set by line
+testLineNest <-
+  test %>%
+  nest(-line_name)
+
+predictionsLineNest <-
+  testLineNest %>%
+  mutate(
+    A_Time = map(.x = data, fit = reg1, .f = modelPred),
+    B_Space = map(.x = data, fit = reg2, .f = modelPred),
+    C_SpaceTime = map(.x = data, fit = reg3, .f = modelPred),
+    D_Weather = map(.x = data, fit = reg4, .f = modelPred),
+    E_System = map(.x = data, fit = reg5, .f = modelPred),
+    F_HourLag = map(.x = data, fit = reg6, .f = modelPred),
+    G_WeekLag = map(.x = data, fit = reg7, .f = modelPred),
+  )
+
+# calculate error metrics
+predictionsLineNest <-
+  predictionsLineNest %>%
+  gather(Regression, Prediction, -data, -line_name) %>%
+  mutate(
+    Observed = map(data, pull, per_train_delay),
+    Absolute_Error = map2(Observed, Prediction, ~ abs(.x - .y)),
+    Line_MAE = map_dbl(Absolute_Error, mean),
+    Line_sd_AE = map_dbl(Absolute_Error, sd)
+  )
+
+predictions <-
+  predictionsLineNest %>%
+  unnest()
+```
+
+
+### Which model worked best?
+
+The first plot below shows how each model performed across all lines, stations, time periods, and lengths of delay. 
+
+The downward trend in errors from the first model to the sixth should be unsurprising to anyone familiar with past work along similar lines. The most unexpected finding, in our eyes, was the fact that the model based on weekly lags resulted in lower errors than the one based on hourly lags. 
+
+We expected the model that included delay information from an hour ago to significantly outperform the one based on week-old data, and mostly tested the week lags to acknowledge that, in reality, predicting a train delay an hour from now is far less useful from the perspective of a transit operator -- who at that point would be hard pressed to do very much about it -- than a prediction for at least a week out. 
+
+
+```{r plot errors by model, fig.width=5.5, fig.height=4}
+
+errorsByModel <-
+  predictions %>%
+  group_by(Regression) %>%
+  summarize(MAE = mean(Absolute_Error))
+
+ggplot(errorsByModel, aes(Regression, MAE)) +
+  geom_bar(aes(fill = Regression), 
+           stat = "identity", 
+           position = "dodge", 
+           alpha = 0.75) +
+  scale_fill_manual(values = palette8) +
+  labs(
+      title = "Mean absolute errors",
+      subtitle = "by model; delay is hourly per-train average by station and line",
+      x = ""
+    ) +
+    plotTheme
+```
+
+### Model errors by delay length
+
+Because correctly predicting more serious adverse outcomes -- that is, longer delays -- is more helpful to transit operators than predicting that most trains will be more or less on time, we also looked at model errors for delays at least 10 minutes in length. Again, the model that included weekly lag information performed better than all other variants.
+
+```{r plot errors by model: longer delays, fig.width=5.5, fig.height=4}
+
+badErrorsByModel <-
+  filter(predictions, per_train_delay > 10) %>%
+  group_by(Regression) %>%
+  summarize(MAE = mean(Absolute_Error))
+
+ggplot(badErrorsByModel, aes(Regression, MAE)) +
+  geom_bar(aes(fill = Regression), 
+           stat = "identity", 
+           position = "dodge", 
+           alpha = 0.75) +
+  scale_fill_manual(values = palette8) +
+  labs(
+      title = "Mean absolute errors: Delays of more than 10 minutes",
+      subtitle = "by model; delay is hourly per-train average by station and line",
+      x = ""
+    ) +
+    plotTheme
+
+```
+
+
+### Model errors by line
+
+As with delay lengths overall, the Philadelphia-Atlantic City line was the clear outlier with respect to model errors. However, it was also the site of the most dramatic difference not just between the non-lag models and the lag models, but between the hourly lag model and the weekly lag one.
+
+```{r plot errors by line, eval = F}
+
+# TODO: fix this
+
+predictionsLineNest %>%
+  dplyr::select(line_name, Regression, Line_MAE) %>%
+  gather(variable, Line_MAE, -Regression, -line_name) %>%
+  ggplot(aes(line_name, Line_MAE)) +
+    geom_bar(aes(fill = Regression), stat = "identity", position = "dodge", alpha = 0.75) +
+    scale_fill_manual(values = palette8) +
+    labs(
+      title = "Mean absolute errors",
+      subtitle = "by model and line",
+      y = "MAE",
+      x = ""
+    ) +
+    plotTheme +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+```
+
+### Errors by hour and station
+
+Breaking down errors further, by station by hour, shows that while the Atlantic City Line errors dwarf the errors on any other line, those errors are not necessarily localized to the same stations at all hours of the day. differentOne aspect of the spatial process of train delays that this indirectly highlights is that trains are, by definition, moving objects, and attempting to locate delays in a static way -- such as by conceptualizing delays as happening at the station level -- may only go so far.
+
+
+```{r mae by hour and station, fig.height=12, fig.width=12}
+
+hourErrors <-
+  filter(predictions, Regression == "G_WeekLag") %>%
+  dplyr::select(station_id,
+                Absolute_Error,
+                interval60) %>%
+  gather(Variable,
+         Value,
+         -interval60,
+         -station_id) %>%
+  # filter(wday(interval60, label = TRUE) == "Tue" & week(interval60) == 42) %>%
+  group_by(hour = hour(interval60), station_id) %>%
+  summarize(MAE = mean(Value)) %>%
+  left_join(stations) %>%
+  st_sf()
+
+hourErrors %>%
+  ggplot() +
+  geom_sf(data=njCounties, colour = "#222222", fill = "#3a3a3a") +
+  geom_sf(data=njLines, colour = "#888888", fill = NA, size=0.66) +
+  geom_sf(pch = 21,
+          colour = 'NA',
+          alpha = 0.75,
+          aes(size = MAE,
+          fill = MAE)) +
+  facet_wrap(~hour, ncol = 6) +
+  scale_fill_gradient(low='#91bfdb',
+                       high='#fc8d59',
+                      guide='colorbar') +
+  scale_size_continuous(range = c(0,4)) +
+  labs(title="Mean absolute error by hour and station",
+       subtitle = "NJ Transit rail lines") +
+  guides(size=F,
+         fill=guide_colorbar(title="MAE", barwidth = 20)) +
+  mapTheme
+
+```
+
+### Predicted and observed delays over time
+
+As the composite chart below shows, most of the models picked up that there is some cyclical pattern to delays, but the lag-based models also capture _some_ of the larger and more irregular spikes, even if they still fall short.
+
+Without weather included as a feature, the model based on space fixed effects alone is close to a flat line -- presumably because including weather indirectly incorporates some time information, as temperatures drop at night and rise during the day. (An early version of the "space" model that did include weather displayed a mild cyclical pattern in delays.)
+
+
+```{r plot predicted and observed by hour, fig.height=8, fig.width=6}
+
+
+predTimePlotData <- 
+  predictionsLineNest %>%
+  mutate(
+    interval60 = map(data, pull, interval60),
+    line_station = map(data, pull, line_station),
+  ) %>%
+  dplyr::select(interval60, line_station, Observed, Prediction, Regression) %>%
+  unnest() %>%
+  rename(Predicted = Prediction) %>%
+  gather(variable, value, -Regression, -interval60, -line_station) %>%
+  group_by(Regression, variable, interval60) %>%
+  summarize(value = mean(value))
+
+filter(predTimePlotData) %>%
+  ggplot(aes(interval60, value, color = variable)) +
+  geom_line() +
+  geom_vline(data = mondays, aes(xintercept = interval60), 
+             size = 0.25, color = "white") +
+  facet_wrap(~Regression, ncol = 1) +
+  scale_color_manual(values = palette2) +
+  labs(title = "Predicted and observed average per-train delays",
+       subtitle = "Vertical lines indicate Mondays",
+       x = "Date",
+       y = "Minutes") +
+  plotTheme +
+  theme(legend.position = "bottom")
+
+
+```
+
+
+### Predicted and observed delays, generally
+
+Plotting predicted delays against observed delays shows us, more than anything, that predicting train delays accurately is extremely hard! All seven of our models underpredicted delays at the high end, and all but the last two did so very egregiously. More than anything, the plots below serve to illustrate the power of lagged variables.
+
+```{r plot predicted and observed by delay length}
+
+ggplot(data = predictions, 
+       aes(x = Observed, 
+           y = Prediction)) +
+  geom_point(color = themeLightBlue, size = 0.5) +
+  geom_abline(color = themeOrange, intercept = 0, slope = 1, size = 0.5) +
+  facet_wrap(~Regression) +
+  labs(title = "Predicted delay as a function of observed delay",
+       subtitle = "by model; delays in minutes; orange line represents perfect prediction",
+       x = "Observed delay",
+       y = "Predicted delay") +
+  plotTheme
+
+```
+
+
+### Cross-validation
+
+To further test our model quality, we attempted (repeatedly, in various ways) to perform leave one group out cross-validation (LOGO-CV) on the full five-week panel. However, because both line and station were independent variables in our model, and because station and county were perfectly collinear, the LOGO-CV method did not work. (We were unable to perform LOGO-CV by hour or day of week for the same reason.)
+
+```{r logo-cv, eval=F}
+
+# define regression variables for cross-validation function
+finalVars <- c(timeVars, 
+               spaceVars, 
+               weatherVars, systemVars, weeklyLagVars)
+
+# modify cross-validation function for assaults variable
+crossValidate <- function(dataset, id, dependentVariable, indVariables) {
+  
+  allPredictions <- data.frame()
+  cvID_list <- unique(dataset[[id]])
+  
+  for (i in cvID_list) {
+    
+    thisFold <- i
+    cat("This hold out fold is", thisFold, "\n")
+    
+    fold.train <- filter(dataset, dataset[[id]] != thisFold) %>% as.data.frame() %>% 
+      dplyr::select(id, indVariables, dependentVariable)
+    fold.test  <- filter(dataset, dataset[[id]] == thisFold) %>% as.data.frame() %>% 
+      dplyr::select(id, indVariables, dependentVariable)
+    
+    thisModel <- 
+      as.formula(
+        paste(
+          dependentVariable,
+          paste(indVariables, collapse = " + "),
+          sep = " ~ "))
+    
+    regression <- lm(thisModel, data = fold.train %>% dplyr::select(-id))
+    
+    thisPrediction <- 
+      mutate(fold.test, Prediction = predict(regression, fold.test, type = "response"))
+    
+    allPredictions <-
+      rbind(allPredictions, thisPrediction)
+    
+  }
+  return(allPredictions)
+}  
+
+countyCV <-crossValidate(dataset = lineStationPanel, 
+                        id = "GEOID",
+                        dependentVariable = "per_train_delay", 
+                        indVariables = finalVars)
+
+```
+
+With LOGO-CV unavailable, we conducted random k-fold cross-validation. Because our model includes lagged variables, using random sampling for cross-validation does run the risk of introducing statistical interdependencies between the training and validation sets. We would be interested to hear suggestions for other cross-validation methodologies that might be more suitable in this instance.
+
+```{r k-fold cross validation, cache.lazy = F, fig.width=5.5, fig.height=4}
+
+# --- perform k-fold cross-validation ---
+
+# set parameters
+control <- trainControl(method = "cv", number = 10)
+set.seed(337)
+
+# train model
+regCV <-
+  train(
+    per_train_delay ~ .,
+    data = lineStationPanel,
+    method = "lm",
+    trControl = control,
+    na.action = na.omit
+  )
+
+# retrieve MAE for all folds
+cvMAE <- data.frame(MAE = regCV$resample[, 3])
+
+# plot MAE distribution as histogram
+ggplot() +
+  geom_histogram(data = cvMAE, 
+                 aes(x = MAE), 
+                 fill = "#6baed6",
+                 color = "#222222",
+                 binwidth = 0.002,
+                 alpha = 0.66) +
+  geom_vline(xintercept = mean(cvMAE$MAE), color = "white", linetype = 2) +
+  scale_x_continuous(breaks = round(seq(0, max(cvMAE$MAE), by = 0.005), 4)) +
+  labs(title = "Distribution of mean absolute error",
+       subtitle = "k-fold cross-validation; k = 10; dashed line at mean",
+       x = "MAE",
+       y = "Folds") +
+  plotTheme
+
+```
+
+```{r k-fold table, results='asis'}
+
+# calculate mean and standard deviation MAE
+validationTable <- data.frame(Mean = round(mean(cvMAE$MAE), 3),
+                              StdDev = round(sd(cvMAE$MAE), 3))
+
+# generate polished table
+validationTable %>%
+  kbl(caption = "MAE across 10  folds", digits = 3) %>%
+  kable_classic(full_width = FALSE)
+
+```
+
+***
+
+## How is our model useful?
+
+We believe our model represents, at the very least, a step toward more systematically predicting the types of cyclical delays that suggest where a transit system could benefit from schedule adjustments -- providing actionable opportunity for low-cost traveler experience improvements of a kind we suspect transit agency managers can see merit in.
+
+Where our model has room to grow is in predicting the rarer, but much larger, delays caused by more substantial system breakdowns. In addition to much larger training sets and a substantially extended study period, this will likely require going beyond publicly available data. It may also require bringing on team members with more subject matter expertise in engineering: __NJ.com__ has [reported](https://www.nj.com/news/2021/07/breakdowns-now-the-top-cause-for-canceled-nj-transit-trains-neglect-and-underfunding-to-blame.html) that mechanical breakdowns attributed to underfunding and neglect are now the top cause of NJ Transit cancellations, and in September 2021, the system experienced [major delays caused by downed overhead wires](https://www.nj.com/news/2021/09/downed-wires-bring-major-delays-on-amtrak-nj-transit-rail-lines.html). 
+
+Still, we at HEADWAY hope that our thoughtful approach and our dedication to a quality product speak for themselves, and look forward to continuing to demonstrate our product's value to both transit operators and the broader public.

@@ -1,0 +1,102 @@
+---
+title: "CVchunk"
+author: "Adrian Leon"
+date: "16/12/2021"
+output: html_document
+---
+
+
+```{r LOGO CV}
+
+# Cross-Validations: by county and rail line.
+
+# Regression with LOGO-CV by county
+
+indVariables <-  c('interval60','dotw','Temperature','lagHour','lag2Hours','lag3Hours','lag12Hours','lag1day')
+dependentVariable <- 'delayAggr'
+
+countyPredictions <- data.frame()
+cvIDcounty_list <- unique(delaysPanelSpatial[["GEOID"]])
+  
+for (i in cvIDcounty_list) {
+  thisFold <- i
+  cat("This hold out fold is", thisFold, "\n")
+    
+  fold.train <- filter(delaysPanelSpatial, delaysPanelSpatial[["GEOID"]] != thisFold) %>% as.data.frame() %>% 
+    dplyr::select(GEOID, geometry, indVariables, dependentVariable)
+  fold.test  <- filter(delaysPanelSpatial, delaysPanelSpatial[["GEOID"]]  == thisFold) %>% as.data.frame() %>% 
+    dplyr::select(GEOID, geometry, indVariables, dependentVariable)
+  
+  regression <-
+    lm(delayAggr ~ .,
+       data = fold.train %>% 
+         dplyr::select(-geometry, -GEOID))
+    
+  thisPrediction <- 
+    mutate(fold.test, Prediction = predict(regression, fold.test, type = "response"))
+    
+  countyPredictions <-
+    rbind(countyPredictions, thisPrediction)
+    
+  }
+
+regCVcounties <- st_sf(countyPredictions)
+
+# compute errors and MAE by station/hour
+regCV1 <- regCVcounties %>% 
+  st_drop_geometry() %>%
+  mutate(regression = 'spatial CV counties',                  # identify regression
+         interval60 =  delaysPanelSpatial$interval60,         # join time back
+         week = week(interval60)) %>%       
+  mutate(station = delaysPanelSpatial$station) %>%            # join stations back
+  rename('Observed' = delayAggr) %>%
+  mutate(absoluteError = abs(Observed - Prediction))          # get absolute error
+
+
+
+
+# Regression with LOGO-CV by county
+
+delaysPanelSpatial2 <- delaysPanelSpatial %>%
+  mutate(line = str_match(station, '([^0-9_]+)'))
+linePredictions <- data.frame()
+cvIDline_list <- unique(delaysPanelSpatial2[["line"]][,1])
+
+  
+for (i in cvIDline_list) {
+  thisFold <- i
+  cat("This hold out fold is", thisFold, "\n")
+    
+  fold.train <- filter(delaysPanelSpatial, delaysPanelSpatial2[["line"]] != thisFold) %>% as.data.frame() %>% 
+    dplyr::select(GEOID, geometry, indVariables, dependentVariable)
+  fold.test  <- filter(delaysPanelSpatial, delaysPanelSpatial2[["line"]]  == thisFold) %>% as.data.frame() %>% 
+    dplyr::select(GEOID, geometry, indVariables, dependentVariable)
+  
+  regression <-
+    lm(delayAggr ~ .,
+       data = fold.train %>% 
+         dplyr::select(-geometry, -GEOID))
+    
+  thisPrediction <- 
+    mutate(fold.test, Prediction = predict(regression, fold.test, type = "response"))
+    
+  linePredictions <-
+    rbind(linePredictions, thisPrediction)
+    
+  }
+
+regCVlines <- st_sf(linePredictions)
+
+
+# compute errors and MAE by station/hour
+regCV2 <- regCVlines %>% 
+  st_drop_geometry() %>%
+  mutate(regression = 'spatial CV lines',                     # identify regression
+         interval60 =  delaysPanelSpatial$interval60,         # join time back
+         week = week(interval60)) %>%       
+  mutate(station = delaysPanelSpatial$station) %>%            # join stations back
+  rename('Observed' = delayAggr) %>%
+  mutate(absoluteError = abs(Observed - Prediction))          # get absolute error
+
+
+```
