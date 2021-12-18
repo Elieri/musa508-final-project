@@ -677,6 +677,9 @@ The models:
 
 We note that, while the examples we studied previously included weather in all the models, we chose to leave weather out of the first three models and only introduce it in the fourth, in an attempt to truly isolate the contributions of the various groups of features.
 
+As our dependent variable, we modeled the mean delay in minutes per train scheduled to pass through a given station per hour per day. We chose this outcome variable over the total delay per station per hour to facilitate comparison between stations with different train frequency, and to avoid our model simply becoming a model of how busy a station is, since outside of extreme circumstances a station with many scheduled trains will experience higher total delays than a station with only one train scheduled.
+
+
 ```{r model development}
 
 timeVars <- c("hour", "day")
@@ -1070,7 +1073,7 @@ With LOGO-CV unavailable, we conducted random k-fold cross-validation. Because o
 # --- perform k-fold cross-validation ---
 
 # set parameters
-control <- trainControl(method = "cv", number = 10)
+control <- trainControl(method = "cv", number = 20)
 set.seed(337)
 
 # train model
@@ -1097,7 +1100,7 @@ ggplot() +
   geom_vline(xintercept = mean(cvMAE$MAE), color = "white", linetype = 2) +
   scale_x_continuous(breaks = round(seq(0, max(cvMAE$MAE), by = 0.005), 4)) +
   labs(title = "Distribution of mean absolute error",
-       subtitle = "k-fold cross-validation; k = 10; dashed line at mean",
+       subtitle = "k-fold cross-validation; k = 20; dashed line at mean",
        x = "MAE",
        y = "Folds") +
   plotTheme
@@ -1112,7 +1115,7 @@ validationTable <- data.frame(Mean = round(mean(cvMAE$MAE), 3),
 
 # generate polished table
 validationTable %>%
-  kbl(caption = "MAE across 10  folds", digits = 3) %>%
+  kbl(caption = "MAE across 20 folds", digits = 3) %>%
   kable_classic(full_width = FALSE)
 
 ```
